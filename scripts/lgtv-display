@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# lgtv-display — toggle what the LG OLED55CXPTA shows on HDMI 4 (deePC)
+#
+# This box has a single HDMI output driving a single panel (the TV itself).
+# There is therefore NO mirror/extend mode worth implementing — xrandr always
+# sees one display (HDMI-0 3840x2160), and we never touch it. We only ask the
+# TV to switch *which app surface* it renders, via the local lgtv-core daemon.
+#
+# Subcommands:
+#   tv-show   Wake the TV (if off) and switch input to HDMI 4 → desktop visible
+#   tv-hide   Switch the TV to the SAFE_APP (YouTube) → desktop off-screen,
+#             deePC keeps rendering, all windows stay where they are
+#   tv-off   Gracefully power off the TV; deePC display stays "connected"
+#   state    Pretty-print the TV state JSON
+#
+# All TV control goes through the local lgtv-core daemon on port 8765.
+# DO NOT talk to the TV WebSocket directly from this script.
+
+set -euo pipefail
+
+DAEMON="http://127.0.0.1:8765"
+HDMI_APP="com.webos.app.hdmi4"
+SAFE_APP="youtube.leanback.v4"   # edit this to pick a different "hide" target
+TIMEOUT_SECS=10
+
+usage() {
+  cat <<'EOF'
+Usage: lgtv-display <subcommand>
+
+Subcommands:
+  tv-show     Wake TV and switch to HDMI 4 (show the deePC desktop)
+  tv-hide     Switch TV to the safe app (YouTube) — desktop off-screen
+  tv-off      Gracefully power off the TV (deePC keeps rendering)
+  state       Pretty-print the daemon's /state response
+  -h, --help  This help
+
+Edit SAFE_APP at the top of the script to change the "hide" target.
+EOF
+}
+
+die() { echo "lgtv-display: $*" >&2; exit 1; }
+
+require_daemon() {
+  curl -fsS --max-time 3 "$DAEMON/state" >/dev/null 2>&1 \
+    || die "lgtv-core daemon unreachable at $DAEMON"
+}
+
+get_state() {
+  curl -fsS --max-time 3 "$DAEMON/state"
+}
+
+wake_tv() {
+  echo "  -> POST /wake"
+  curl -fsS --max-time 5 -X POST "$DAEMON/wake" -H 'Content-Type: application/json' -d '{}' \
+    | jq -c . || true
+}
+
+launch_app() {
+  local app_id="$1"
+  echo "  -> POST /app/launch id=$app_id"
+  curl -fsS --max-time 5 -X POST "$DAEMON/app/launch" \
+    -H 'Content-Type: application/json' \
+    -d "{\"id\": \"$app_id\"}" \
+    | jq -c . || true
+}
+
+# Note: we use /app/launch for HDMI inputs too. The dedicated /input/switch
+# endpoint returns 502 intermittently when the TV is on a streaming app
+# (observed on this OLED55CXPTA), whereas /app/launch with the HDMI app id
+# works reliably — HDMI inputs are surfaced as apps in WebOS.
+
+wait_for_app() {
+  local target="$1"
+  local elapsed=0
+  while (( elapsed < TIMEOUT_SECS )); do
+    local cur
+    cur=$(get_state | jq -r '.current_app_id // ""')
+    if [[ "$cur" == "$target" ]]; then
+      echo "  -> current_app_id=$target (after ${elapsed}s)"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "  -> WARN: timed out waiting for current_app_id=$target (last seen: ${cur:-unknown})" >&2
+  return 1
+}
+
+cmd_state() {
+  require_daemon
+  get_state | jq
+}
+
+cmd_tv_show() {
+  require_daemon
+  local is_on
+  is_on=$(get_state | jq -r '.is_on')
+  if [[ "$is_on" != "true" ]]; then
+    echo "TV is off — waking..."
+    wake_tv
+    sleep 2
+  fi
+  launch_app "$HDMI_APP"
+  wait_for_app "$HDMI_APP"
+}
+
+cmd_tv_hide() {
+  require_daemon
+  local is_on
+  is_on=$(get_state | jq -r '.is_on')
+  if [[ "$is_on" != "true" ]]; then
+    die "TV is off — nothing to hide (use 'tv-show' to wake)"
+  fi
+  launch_app "$SAFE_APP"
+  wait_for_app "$SAFE_APP"
+}
+
+cmd_tv_off() {
+  require_daemon
+  echo "  -> POST /power/off"
+  curl -fsS --max-time 5 -X POST "$DAEMON/power/off" \
+    -H 'Content-Type: application/json' -d '{}' \
+    | jq -c . || true
+}
+
+main() {
+  if (( $# < 1 )); then usage; exit 2; fi
+  case "$1" in
+    tv-show)    cmd_tv_show ;;
+    tv-hide)    cmd_tv_hide ;;
+    tv-off)     cmd_tv_off ;;
+    state)      cmd_state ;;
+    -h|--help)  usage ;;
+    *)          usage; exit 2 ;;
+  esac
+}
+
+main "$@"
