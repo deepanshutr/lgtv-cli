@@ -3,7 +3,7 @@ module github.com/deepanshutr/lgtv-cli
 go 1.23
 
 require (
-	github.com/go-telegram/bot v1.11.1
+	github.com/go-telegram/bot v1.22.0
 	github.com/spf13/cobra v1.8.1
 )
 
